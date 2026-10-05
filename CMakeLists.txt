@@ -1,0 +1,388 @@
+# ClamWin GUI — Native Win32 C++ frontend
+# Spawns clamscan.exe / freshclam.exe (no libclamav link dependency)
+
+cmake_minimum_required(VERSION 3.14)
+project(clamwin VERSION "1.5.2.1")
+
+if(MINGW AND CMAKE_C_COMPILER)
+    get_filename_component(CW_MINGW_BIN_DIR "${CMAKE_C_COMPILER}" DIRECTORY)
+    set(CW_RC_PREPROCESSOR "${CW_MINGW_BIN_DIR}/cpp.exe")
+    if(EXISTS "${CW_RC_PREPROCESSOR}")
+        file(TO_CMAKE_PATH "${CW_RC_PREPROCESSOR}" CW_RC_PREPROCESSOR)
+        if(NOT CMAKE_RC_FLAGS MATCHES "(^| )--preprocessor=")
+            set(CMAKE_RC_FLAGS "${CMAKE_RC_FLAGS} --preprocessor=${CW_RC_PREPROCESSOR} --preprocessor-arg=-DRC_INVOKED")
+        endif()
+    endif()
+endif()
+
+# ── curl + OpenSSL (from clamav-win32 prebuilts) ──────────────────────────
+# The update checker uses libcurl + static OpenSSL for HTTPS so that TLS 1.2
+# works on Windows XP without relying on the OS's SChannel.
+#
+# Discovery order:
+#   1. libcurl_static CMake target already defined (parent/sibling build)
+#   2. Sibling clamav-win32 compatibility archives
+#
+# CLAMWIN_CURL_ROOT is retained only as a header-location hint for curl headers.
+# Do not fall back to toolchain-provided libcurl/libssl/libcrypto libraries here:
+# those binaries are not compatible with older Windows versions supported by the
+# GUI (XP / Server 2003).
+
+if(TARGET libcurl_static)
+    # ── Case 1: already defined by a parent/sibling build ──
+    # libcurl_static carries OpenSSL transitively; do not double-link the .a.
+    set(CW_CURL_INCLUDE "")           # headers already on the include path
+    set(CW_OPENSSL_INCLUDE "")
+    set(CW_CURL_LINK_LIBS libcurl_static)
+    set(CW_CURL_IS_STATIC TRUE)
+else()
+    # ── Case 2: sibling compat archives ──
+    # Only use the legacy-compatible curl/OpenSSL archives produced or vendored
+    # by clamav-win32.  Falling back to CLAMWIN_CURL_ROOT/MSYS2 libraries can
+    # introduce imports that fail on XP / Server 2003.
+    get_filename_component(_CW_ROOT "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
+    set(_CW_SIBLING_ROOT "${_CW_ROOT}/clamav-win32")
+
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        set(_CW_SIBLING_BUILD "${_CW_SIBLING_ROOT}/build-x64-mingw")
+        set(_CW_OPENSSL_PREBUILT "${_CW_SIBLING_ROOT}/3rdparty/openssl/lib/mingw/x64")
+    else()
+        set(_CW_SIBLING_BUILD "${_CW_SIBLING_ROOT}/build-x86-mingw-winxp")
+        set(_CW_OPENSSL_PREBUILT "${_CW_SIBLING_ROOT}/3rdparty/openssl/lib/mingw/x86")
+    endif()
+
+    find_library(CW_LIBCURL NAMES libcurl.a
+        HINTS
+            "${_CW_SIBLING_BUILD}/3rdparty/curl/lib"
+        NO_DEFAULT_PATH)
+    find_library(CW_LIBSSL NAMES libssl.a ssl libssl
+        HINTS
+            "${_CW_OPENSSL_PREBUILT}"
+        NO_DEFAULT_PATH)
+    find_library(CW_LIBCRYPTO NAMES libcrypto.a crypto libcrypto
+        HINTS
+            "${_CW_OPENSSL_PREBUILT}"
+        NO_DEFAULT_PATH)
+
+    set(_CW_COMPAT_CURL_MISSING)
+    foreach(_cw_required_var CW_LIBCURL CW_LIBSSL CW_LIBCRYPTO)
+        if(NOT ${_cw_required_var})
+            list(APPEND _CW_COMPAT_CURL_MISSING ${_cw_required_var})
+        endif()
+    endforeach()
+
+    if(NOT _CW_COMPAT_CURL_MISSING)
+        # Resolve include paths: prefer CLAMWIN_CURL_ROOT for headers when it
+        # is provided, otherwise use the sibling curl headers.
+        if(CLAMWIN_CURL_ROOT)
+            set(CW_CURL_INCLUDE "${CLAMWIN_CURL_ROOT}/include")
+        else()
+            set(CW_CURL_INCLUDE "${_CW_SIBLING_ROOT}/3rdparty/curl/include")
+        endif()
+
+        if(EXISTS "${_CW_SIBLING_ROOT}/3rdparty/openssl/include")
+            set(CW_OPENSSL_INCLUDE "${_CW_SIBLING_ROOT}/3rdparty/openssl/include")
+        else()
+            set(CW_OPENSSL_INCLUDE "")
+        endif()
+
+        set(CW_CURL_LINK_LIBS
+            "${CW_LIBCURL}"
+            "${CW_LIBSSL}"
+            "${CW_LIBCRYPTO}"
+        )
+        set(CW_CURL_IS_STATIC TRUE)
+    else()
+        string(JOIN ", " _cw_missing_desc ${_CW_COMPAT_CURL_MISSING})
+        message(FATAL_ERROR
+            "Missing required legacy-compatible curl/OpenSSL archives: ${_cw_missing_desc}. "
+            "Expected libcurl.a under ${_CW_SIBLING_BUILD}/3rdparty/curl/lib and "
+            "libssl.a/libcrypto.a under ${_CW_OPENSSL_PREBUILT}. "
+            "Toolchain-provided libraries are intentionally rejected because they "
+            "produce binaries that fail on older Windows versions."
+        )
+    endif()
+endif()
+
+# ── clamav_compat: legacy compatibility library from clamav-win32 ───────────
+# Provides IAT-level shims for Vista+ APIs (SRW locks, condition variables,
+# bcrypt, secure CRT functions, etc.) using assembly forwarders — the same
+# library freshclam links against. Use it whenever a sibling legacy engine
+# build exists so the GUI does not import bcrypt.dll on pre-Vista systems.
+set(CW_COMPAT_LINK_LIBS)
+set(CW_BCRYPT_LINK_LIBS bcrypt)
+get_filename_component(_CW_ROOT2 "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_CW_COMPAT_BUILD_DIR "${_CW_ROOT2}/clamav-win32/build-x64-mingw")
+else()
+    set(_CW_COMPAT_BUILD_DIR "${_CW_ROOT2}/clamav-win32/build-x86-mingw-winxp")
+endif()
+
+find_library(CW_LIBCLAMAV_COMPAT NAMES clamav_compat libclamav_compat
+    HINTS "${_CW_COMPAT_BUILD_DIR}")
+if(CW_LIBCLAMAV_COMPAT)
+    list(APPEND CW_COMPAT_LINK_LIBS "${CW_LIBCLAMAV_COMPAT}" ntdll)
+    set(CW_BCRYPT_LINK_LIBS)
+    message(STATUS "Legacy compat: found ${CW_LIBCLAMAV_COMPAT}")
+else()
+    message(STATUS "Legacy compat: not found, linking bcrypt directly")
+endif()
+
+get_filename_component(_CW_REPO_ROOT "${CMAKE_SOURCE_DIR}/.." ABSOLUTE)
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(CW_CA_BUNDLE_FLAVOR "legacy-x64")
+    set(CW_CA_BUNDLE_ENGINE_BUILD "${_CW_REPO_ROOT}/clamav-win32/build-x64-mingw")
+else()
+    set(CW_CA_BUNDLE_FLAVOR "legacy-x86")
+    set(CW_CA_BUNDLE_ENGINE_BUILD "${_CW_REPO_ROOT}/clamav-win32/build-x86-mingw-winxp")
+endif()
+
+find_file(CW_CA_BUNDLE_SOURCE
+    NAMES curl-ca-bundle.crt
+    HINTS
+        "${CW_CA_BUNDLE_ENGINE_BUILD}"
+        "${_CW_REPO_ROOT}/binaries/all-os-staging/clamav-${PROJECT_VERSION}-${CW_CA_BUNDLE_FLAVOR}"
+)
+
+
+set(clamwin
+    cw_main.cpp
+    cw_application.cpp
+    cw_cli_args.cpp
+    cw_auto_close.cpp
+    cw_bg_task.cpp
+    cw_log_utils.cpp
+    cw_dashboard.cpp
+    cw_window.cpp
+    cw_dialog.cpp
+    cw_config.cpp
+    cw_process.cpp
+    cw_scan_logic.cpp
+    cw_prefs_validation.cpp
+    cw_scan_dialog.cpp
+    cw_about_dialog.cpp
+    cw_logview_dialog.cpp
+    cw_prefs_dialog.cpp
+    cw_schedule_dialog.cpp
+    cw_tray.cpp
+    cw_scheduler.cpp
+    cw_utils.cpp
+    cw_theme.cpp
+    cw_update_checker.cpp
+)
+
+# Legacy function-based GUI modules were removed after the cw_* class migration.
+set(clamwin_legacy)
+
+set(clamwin_resources resources/clamwin.rc)
+
+set(CW_BUILD_COUNTER_FILE ${CMAKE_BINARY_DIR}/cw_gui_build_counter.txt)
+set(CW_BUILD_VERSION_HEADER ${CMAKE_BINARY_DIR}/cw_build_version.h)
+set(CW_BUILD_VERSION_RC ${CMAKE_BINARY_DIR}/cw_build_version.rc)
+set(CW_BUILD_VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/increment_clamwin_build_version.cmake)
+
+# Seed generated version files at configure time so includes exist immediately.
+execute_process(
+    COMMAND ${CMAKE_COMMAND}
+            -DCOUNTER_FILE=${CW_BUILD_COUNTER_FILE}
+            -DHEADER_OUT=${CW_BUILD_VERSION_HEADER}
+            -DRC_OUT=${CW_BUILD_VERSION_RC}
+            -DBASE_MAJOR=${PROJECT_VERSION_MAJOR}
+            -DBASE_MINOR=${PROJECT_VERSION_MINOR}
+            -DBASE_PATCH=${PROJECT_VERSION_PATCH}
+            -DBASE_TWEAK=${PROJECT_VERSION_TWEAK}
+            -DINCREMENT=OFF
+            -P ${CW_BUILD_VERSION_SCRIPT}
+)
+
+add_custom_target(cw_gui_build_version
+    COMMAND ${CMAKE_COMMAND}
+            -DCOUNTER_FILE=${CW_BUILD_COUNTER_FILE}
+            -DHEADER_OUT=${CW_BUILD_VERSION_HEADER}
+            -DRC_OUT=${CW_BUILD_VERSION_RC}
+            -DBASE_MAJOR=${PROJECT_VERSION_MAJOR}
+            -DBASE_MINOR=${PROJECT_VERSION_MINOR}
+            -DBASE_PATCH=${PROJECT_VERSION_PATCH}
+            -DBASE_TWEAK=${PROJECT_VERSION_TWEAK}
+            -DINCREMENT=OFF
+            -P ${CW_BUILD_VERSION_SCRIPT}
+    BYPRODUCTS ${CW_BUILD_VERSION_HEADER} ${CW_BUILD_VERSION_RC}
+    COMMENT "Generating ClamWin GUI build version header"
+    VERBATIM
+)
+
+file(GLOB clamwin_headers *.h)
+
+source_group("Source Files"  FILES ${clamwin})
+source_group("Legacy Files"  FILES ${clamwin_legacy})
+source_group("Header Files"  FILES ${clamwin_headers})
+source_group("Resources"     FILES ${clamwin_resources})
+
+add_executable(clamwin WIN32
+    ${clamwin}
+    ${clamwin_legacy}
+    ${clamwin_headers}
+    ${clamwin_resources}
+)
+
+if(CW_CA_BUNDLE_SOURCE)
+    add_custom_command(TARGET clamwin POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CW_CA_BUNDLE_SOURCE}"
+                "$<TARGET_FILE_DIR:clamwin>/curl-ca-bundle.crt"
+        COMMENT "Staging curl-ca-bundle.crt next to clamwin.exe"
+        VERBATIM
+    )
+else()
+    message(WARNING "curl-ca-bundle.crt not found for local GUI build; --check-version may fail TLS verification until the bundle is staged manually")
+endif()
+
+set(clamwin_test_dir tests)
+set(clamwin_test_sources
+    ${clamwin_test_dir}/test_main.cpp
+    ${clamwin_test_dir}/test_support.cpp
+    ${clamwin_test_dir}/test_cli_args.cpp
+    ${clamwin_test_dir}/test_auto_close.cpp
+    ${clamwin_test_dir}/test_auto_close_integration.cpp
+    ${clamwin_test_dir}/test_bg_task.cpp
+    ${clamwin_test_dir}/test_shell_extension_command.cpp
+    ${clamwin_test_dir}/test_config.cpp
+    ${clamwin_test_dir}/test_log_utils.cpp
+    ${clamwin_test_dir}/test_scan_commands.cpp
+    ${clamwin_test_dir}/test_scan_parsers.cpp
+    ${clamwin_test_dir}/test_scan_transcripts.cpp
+    ${clamwin_test_dir}/test_prefs_validation.cpp
+    ${clamwin_test_dir}/test_real_tools.cpp
+    ${clamwin_test_dir}/test_scheduler.cpp
+    ${clamwin_test_dir}/test_utils.cpp
+    ${clamwin_test_dir}/test_update_checker.cpp
+    cw_config.cpp
+    cw_cli_args.cpp
+    cw_auto_close.cpp
+    cw_bg_task.cpp
+    cw_log_utils.cpp
+    cw_process.cpp
+    cw_scan_logic.cpp
+    cw_prefs_validation.cpp
+    cw_scheduler.cpp
+    cw_utils.cpp
+    cw_update_checker.cpp
+    shell-extension/cw_shell_extension_command.cpp
+)
+
+add_executable(clamwin_test
+    ${clamwin_test_sources}
+)
+
+add_dependencies(clamwin cw_gui_build_version)
+add_dependencies(clamwin_test cw_gui_build_version)
+
+if(MINGW)
+    # libwinpthread.a ships a version.o member that contains a VERSIONINFO (.rsrc)
+    # resource (type 10 / name 1 / lang 0x409).  When --whole-archive pulls the whole
+    # archive into the link it clashes with our own VS_VERSION_INFO block in clamwin.rc,
+    # producing "duplicate leaf: type: 10 (VERSION) name: 1 lang: 409".
+    # Fix: make a stripped copy of libwinpthread.a with version.o deleted, and link
+    # against that copy instead.  The version.o member contains only resource data and
+    # no code symbols, so removing it is safe.
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libwinpthread.a
+        OUTPUT_VARIABLE _cw_winpthread_src
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    set(_cw_winpthread_stripped ${CMAKE_BINARY_DIR}/libwinpthread_norsrc.a)
+
+    add_custom_command(
+        OUTPUT  ${_cw_winpthread_stripped}
+        COMMAND ${CMAKE_COMMAND} -E copy ${_cw_winpthread_src} ${_cw_winpthread_stripped}
+        COMMAND ${CMAKE_AR} d ${_cw_winpthread_stripped} version.o
+        DEPENDS ${_cw_winpthread_src}
+        COMMENT "Stripping version resource from libwinpthread.a"
+        VERBATIM
+    )
+    add_custom_target(cw_winpthread_stripped DEPENDS ${_cw_winpthread_stripped})
+    add_dependencies(clamwin      cw_winpthread_stripped)
+    add_dependencies(clamwin_test cw_winpthread_stripped)
+
+    # -static-libstdc++ / -static-libgcc link the C++ and GCC runtime statically.
+    # libstdc++ (posix thread model) references pthread_create; we must ensure
+    # libwinpthread.a (static) is used instead of the DLL import library.
+    # --whole-archive pre-loads all libwinpthread.a symbols so they are already
+    # defined when libstdc++'s implicit trailing pass resolves pthread_create.
+    target_link_options(clamwin PRIVATE
+        -static-libstdc++ -static-libgcc
+        -Wl,--whole-archive,-Bstatic ${_cw_winpthread_stripped} -Wl,-Bdynamic,--no-whole-archive)
+    target_link_options(clamwin_test PRIVATE
+        -static-libstdc++ -static-libgcc
+        -Wl,--whole-archive,-Bstatic ${_cw_winpthread_stripped} -Wl,-Bdynamic,--no-whole-archive)
+endif()
+
+if(MSVC)
+    target_sources(clamwin PRIVATE ${CMAKE_SOURCE_DIR}/resources/compatibility.manifest)
+    target_link_options(clamwin PRIVATE "/MANIFEST:NO")
+endif()
+
+target_include_directories(clamwin PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_BINARY_DIR}
+    ${CW_CURL_INCLUDE}
+    ${CW_OPENSSL_INCLUDE}
+)
+
+target_include_directories(clamwin_test PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/shell-extension
+    ${CMAKE_SOURCE_DIR}/3rdparty/doctest
+    ${CMAKE_BINARY_DIR}
+    ${clamwin_test_dir}
+    ${CW_CURL_INCLUDE}
+    ${CW_OPENSSL_INCLUDE}
+)
+
+target_compile_definitions(clamwin PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+    $<$<BOOL:${CW_CURL_IS_STATIC}>:CURL_STATICLIB>
+)
+
+target_compile_definitions(clamwin_test PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+    $<$<BOOL:${CW_CURL_IS_STATIC}>:CURL_STATICLIB>
+)
+
+target_link_libraries(clamwin PRIVATE
+    comctl32
+    shlwapi
+    version
+    ${CW_CURL_LINK_LIBS}
+    ${CW_COMPAT_LINK_LIBS}
+    crypt32
+    ws2_32
+    ${CW_BCRYPT_LINK_LIBS}
+)
+
+target_link_libraries(clamwin_test PRIVATE
+    shlwapi
+    ${CW_CURL_LINK_LIBS}
+    ${CW_COMPAT_LINK_LIBS}
+    crypt32
+    ws2_32
+    ${CW_BCRYPT_LINK_LIBS}
+)
+
+add_custom_target(clamwin_check
+    COMMAND $<TARGET_FILE:clamwin_test>
+    DEPENDS clamwin_test
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:clamwin_test>
+    USES_TERMINAL
+)
+
+add_custom_target(clamwin_check_real_tools
+    COMMAND ${CMAKE_COMMAND} -E env CLAMWIN_REAL_TOOLS=1 $<TARGET_FILE:clamwin_test>
+    DEPENDS clamwin_test
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:clamwin_test>
+    USES_TERMINAL
+)
+
+add_subdirectory(shell-extension)
+
+list(APPEND CLAMAV_INSTALL_TARGETS clamwin)
