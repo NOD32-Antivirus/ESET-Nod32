@@ -4,7 +4,7 @@ NOD32 Antivirus is the lightweight ESET Nod32 scanner for a computer you sit at.
 
 An eset nod32 antivirus install is a subscription, not a portable toy. This nod32 antivirus page is the short tour: what the scanner does, what it costs, and how a first week should look. Read it before you compare boxes on a store shelf.
 
-![Banner Placeholder](clen/image3.jpg)
+![Banner Placeholder](clean/image3.jpg)
 
 You keep the PC. The publisher keeps the signature updates. When the subscription ends, the updates stop, and a scanner with old signatures is a false sense of safety.
 
@@ -42,7 +42,7 @@ An eset nod32 antivirus 1 device 1 year term is the base figure on this page. A 
 
 Open the main window after the update. The status line should say the protection is on and the signatures are current. If it asks for a restart, do that once, then look again.
 
-![Editor Placeholder](clen/image2.jpg)
+![Editor Placeholder](clean/image2.jpg)
 
 Run one manual scan of a small folder you know is clean, such as a documents directory with a few PDFs. The scan should finish, list zero threats, and write a log you can open. That proves the engine starts. It does not prove every future file is safe.
 
@@ -60,7 +60,7 @@ The home screen is the grid you live in: protection status, last scan, and the u
 
 Glance at that grid after login. A red update line is the thing to fix before you open mail.
 
-![Grid Placeholder](clen/image1.png)
+![Grid Placeholder](clean/image1.png)
 
 Exclusions belong in the product, not in a text file you edit by hand. The shape of a careful list is small:
 
